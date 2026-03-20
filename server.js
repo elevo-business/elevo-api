@@ -25,21 +25,23 @@ const ALLOWED_ORIGINS = [
 
 function jsonResponse(res, status, data) {
   res.writeHead(status, {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*', // wird in CORS-Handler überschrieben
-    'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type'
+    'Content-Type': 'application/json'
   });
   res.end(JSON.stringify(data));
 }
 
 function setCORS(req, res) {
-  const origin = req.headers.origin;
-  if (ALLOWED_ORIGINS.includes(origin)) {
+  const origin = req.headers.origin || '';
+  // Erlaube alle elevo.solutions Subdomains + localhost für Dev
+  if (origin.endsWith('.elevo.solutions') || origin === 'https://elevo.solutions' || origin.startsWith('http://localhost')) {
     res.setHeader('Access-Control-Allow-Origin', origin);
+  } else {
+    // Fallback: elevo.solutions immer erlauben
+    res.setHeader('Access-Control-Allow-Origin', 'https://elevo.solutions');
   }
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Max-Age', '86400');
 }
 
 function parseBody(req) {
