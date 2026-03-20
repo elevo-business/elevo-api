@@ -122,7 +122,12 @@ function validateContact(data) {
         email: data.email.trim().toLowerCase().substring(0, 200),
         topic: (data.topic || 'Allgemein').trim().substring(0, 200),
         message: (data.message || '').trim().substring(0, 2000),
-        source: (data.source || 'Website').trim().substring(0, 100)
+        source: (data.source || 'Website').trim().substring(0, 100),
+        // UTM Tracking
+        utm_source: (data.utm_source || '').trim().substring(0, 200),
+        utm_medium: (data.utm_medium || '').trim().substring(0, 200),
+        utm_campaign: (data.utm_campaign || '').trim().substring(0, 200),
+        utm_term: (data.utm_term || '').trim().substring(0, 200)
       }
     };
   }
@@ -195,7 +200,7 @@ async function handleContact(req, res) {
       return jsonResponse(res, 400, { success: false, errors: validation.errors });
     }
 
-    const { firstName, lastName, email, topic, message, source } = validation.data;
+    const { firstName, lastName, email, topic, message, source, utm_source, utm_medium, utm_campaign, utm_term } = validation.data;
 
     // 1. Person in Pipedrive anlegen
     const person = await pipedriveFetch('/persons', 'POST', {
@@ -208,29 +213,34 @@ async function handleContact(req, res) {
 
     console.log(`✓ Person erstellt: ${person.id} — ${firstName} ${lastName}`);
 
-    // 2. Deal anlegen und mit Person verknüpfen
+    // 2. Deal anlegen mit UTM Custom Fields
     const dealTitle = `${firstName} ${lastName} — ${topic}`;
-    const deal = await pipedriveFetch('/deals', 'POST', {
+    const dealData = {
       title: dealTitle,
       person_id: person.id,
       stage_id: 1, // Erste Stage der ersten Pipeline (wird nach Pipeline-Setup angepasst)
-      visible_to: 3
-    });
+      visible_to: 3,
+      // Custom Fields — UTM Tracking
+      '6a4546e5e0257a3b673d546ab78e9347775613e4': utm_source || source, // Lead Source
+      'e1b0720182b50e2c8efab9bc7c3cbd1799bc7533': utm_campaign,         // UTM Campaign
+      'aa1f6ab9866ce8a50a7f3fe9557cd8b1a6cc6d0f': utm_term,             // UTM Term
+      '0430039ca8ed9f98fa242d5bb2f1d0cb8543af56': utm_medium            // UTM Medium
+    };
+    const deal = await pipedriveFetch('/deals', 'POST', dealData);
 
-    console.log(`✓ Deal erstellt: ${deal.id} — ${dealTitle}`);
+    console.log(`✓ Deal erstellt: ${deal.id} — ${dealTitle} [Source: ${utm_source || source}]`);
 
     // 3. Notiz am Deal hinterlegen (mit allen Details)
-    if (message) {
-      await pipedriveFetch('/notes', 'POST', {
-        deal_id: deal.id,
-        person_id: person.id,
-        content: `<b>Anfrage über ${source}</b><br><br>` +
-                 `<b>Thema:</b> ${topic}<br>` +
-                 `<b>Nachricht:</b><br>${message.replace(/\n/g, '<br>')}<br><br>` +
-                 `<i>Automatisch erstellt via ELEVO API</i>`
-      });
-      console.log(`✓ Notiz erstellt für Deal ${deal.id}`);
-    }
+    const utmInfo = utm_source ? `<br><br><b>📊 Tracking:</b><br>Source: ${utm_source}<br>Medium: ${utm_medium}<br>Campaign: ${utm_campaign}<br>Keyword: ${utm_term}` : '';
+    await pipedriveFetch('/notes', 'POST', {
+      deal_id: deal.id,
+      person_id: person.id,
+      content: `<b>Anfrage über ${utm_source || source}</b><br><br>` +
+               `<b>Thema:</b> ${topic}<br>` +
+               (message ? `<b>Nachricht:</b><br>${message.replace(/\n/g, '<br>')}` : '') +
+               utmInfo + `<br><br><i>Automatisch erstellt via ELEVO API</i>`
+    });
+    console.log(`✓ Notiz erstellt für Deal ${deal.id}`);
 
     // 4. Aktivität anlegen (Follow-up heute)
     const today = new Date().toISOString().split('T')[0];
