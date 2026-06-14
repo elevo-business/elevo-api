@@ -21,10 +21,16 @@ const PIPEDRIVE_BASE = 'https://api.pipedrive.com/v1';
 // Meta Conversions API (server-seitig). Token + Pixel-ID kommen aus der
 // Umgebung (Coolify) — NIE im Code/Repo. Ohne beide Werte wird CAPI still
 // übersprungen, der Rest funktioniert weiter.
-const META_PIXEL_ID = process.env.META_PIXEL_ID;
-const META_CAPI_TOKEN = process.env.META_CAPI_TOKEN;
+// Alias-Namen werden unterstützt, da der neukunden-Referenz-Handler
+// META_DATASET_ID / META_CAPI_ACCESS_TOKEN nutzt — so greift, was gesetzt ist.
+const META_PIXEL_ID = process.env.META_PIXEL_ID || process.env.META_DATASET_ID;
+const META_CAPI_TOKEN = process.env.META_CAPI_TOKEN || process.env.META_CAPI_ACCESS_TOKEN;
 const META_API_VERSION = process.env.META_API_VERSION || 'v21.0';
 const META_TEST_EVENT_CODE = process.env.META_TEST_EVENT_CODE; // optional, nur fürs Testing-Tool
+// Optionaler Schutz für den Pipedrive-Webhook: wenn gesetzt, muss die
+// Webhook-URL ?token=<wert> tragen, sonst 401. Verhindert gefälschte Leads.
+const PIPEDRIVE_WEBHOOK_SECRET = process.env.PIPEDRIVE_WEBHOOK_SECRET;
+const PIPEDRIVE_DOMAIN = process.env.PIPEDRIVE_COMPANY_DOMAIN || 'elevo';
 const ALLOWED_ORIGINS = [
   'https://elevo.solutions',
   'https://www.elevo.solutions',
@@ -112,6 +118,26 @@ function pipedriveFetch(endpoint, method, data) {
     req.on('error', reject);
     req.write(payload);
     req.end();
+  });
+}
+
+// GET-Helfer für Pipedrive (z. B. Person nachladen, um an die E-Mail zu kommen).
+function pipedriveGet(endpoint) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(`${PIPEDRIVE_BASE}${endpoint}`);
+    url.searchParams.set('api_token', PIPEDRIVE_TOKEN);
+    https.get({ hostname: url.hostname, path: url.pathname + url.search }, (res) => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(body);
+          resolve(parsed && parsed.success ? parsed.data : null);
+        } catch (e) {
+          reject(new Error('Pipedrive GET: Antwort nicht lesbar'));
+        }
+      });
+    }).on('error', reject);
   });
 }
 
@@ -427,6 +453,76 @@ async function handleContact(req, res) {
   }
 }
 
+// ─── Pipedrive-Webhook → Meta CAPI (Funnel-Check-Buchungen) ───────
+//
+// Schließt die Tracking-Lücke des Scheduler-iframes: Die Funnel-Check-LP
+// bucht direkt im Pipedrive-Scheduler (kein Formular → kein Browser-Pixel).
+// Pipedrive feuert bei der Buchung diesen Webhook, der server-seitig ein
+// Meta-"Lead"-Event mit gehashter E-Mail/Telefon sendet.
+//
+// Pipedrive-Setup: Einstellungen → Tools & Apps → Webhooks → neuer Webhook
+//   Event: added.deal (bzw. das Objekt, das die Buchung anlegt: lead/deal/activity)
+//   URL:   https://api.elevo.solutions/api/pipedrive-webhook?token=<PIPEDRIVE_WEBHOOK_SECRET>
+//
+// Referenz: neukunden-Repo, capi-webhook/pipedrive-capi-webhook.js
+
+async function handlePipedriveWebhook(req, res, url) {
+  // Optionaler Schutz vor gefälschten Leads.
+  if (PIPEDRIVE_WEBHOOK_SECRET && url.searchParams.get('token') !== PIPEDRIVE_WEBHOOK_SECRET) {
+    return jsonResponse(res, 401, { error: 'unauthorized' });
+  }
+
+  try {
+    const body = await parseBody(req);
+
+    // v1: { event: 'added.deal', current: {...} }
+    // v2: { meta: { action, object }, data: {...} }
+    const ev = body.event || (body.meta ? `${body.meta.action}.${body.meta.object}` : '');
+    const obj = body.current || body.data || {};
+
+    if (!/added\.(lead|deal|activity|person)/.test(ev)) {
+      return jsonResponse(res, 200, { ignored: true, ev });
+    }
+
+    // E-Mail/Telefon bestimmen — ggf. Person nachladen.
+    let email = null, phone = null;
+    if (obj.email) email = Array.isArray(obj.email) ? (obj.email[0] && obj.email[0].value) : obj.email;
+    const personId = (obj.person_id && obj.person_id.value) || obj.person_id || (ev.endsWith('.person') ? obj.id : null);
+    if ((!email || !phone) && personId) {
+      const p = await pipedriveGet(`/persons/${personId}`);
+      if (p) {
+        email = email || (p.email && p.email[0] && p.email[0].value) || p.primary_email || null;
+        phone = phone || (p.phone && p.phone[0] && p.phone[0].value) || null;
+      }
+    }
+
+    if (!email) return jsonResponse(res, 200, { skipped: 'no_email', ev });
+
+    // Idempotenz/Dedup bei Pipedrive-Retries und gegenüber etwaigen Browser-Events.
+    const eventId = `pd_${ev}_${obj.id || personId}`;
+
+    try {
+      await sendMetaConversion({
+        eventName: 'Lead',
+        eventId,
+        eventSourceUrl: 'https://elevo.solutions/funnel-check',
+        clientIp: String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || undefined,
+        userAgent: req.headers['user-agent'],
+        user: { email, phone },
+        customData: { content_name: 'funnel-check-booking' }
+      });
+      return jsonResponse(res, 200, { ok: true, ev, event_id: eventId });
+    } catch (err) {
+      console.error('❌ Meta CAPI (Webhook) Fehler:', err.message);
+      return jsonResponse(res, 502, { ok: false, error: 'meta_capi_failed' });
+    }
+
+  } catch (error) {
+    console.error('❌ Pipedrive-Webhook Fehler:', error.message);
+    return jsonResponse(res, 400, { error: 'bad_request' });
+  }
+}
+
 // ─── Server ───────────────────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
@@ -438,8 +534,12 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
+  // Pfad ohne Query-String matchen (Webhook trägt ?token=…).
+  const url = new URL(req.url, 'http://localhost');
+  const path = url.pathname;
+
   // Routes
-  if (req.method === 'GET' && req.url === '/api/health') {
+  if (req.method === 'GET' && path === '/api/health') {
     return jsonResponse(res, 200, {
       status: 'ok',
       service: 'ELEVO API Proxy',
@@ -451,8 +551,12 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  if (req.method === 'POST' && req.url === '/api/contact') {
+  if (req.method === 'POST' && path === '/api/contact') {
     return handleContact(req, res);
+  }
+
+  if (req.method === 'POST' && path === '/api/pipedrive-webhook') {
+    return handlePipedriveWebhook(req, res, url);
   }
 
   // 404
@@ -462,14 +566,18 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`\n🚀 ELEVO API Proxy läuft auf Port ${PORT}`);
   console.log(`   Health: http://localhost:${PORT}/api/health`);
-  console.log(`   Contact: POST http://localhost:${PORT}/api/contact\n`);
+  console.log(`   Contact: POST http://localhost:${PORT}/api/contact`);
+  console.log(`   Pipedrive-Webhook: POST http://localhost:${PORT}/api/pipedrive-webhook\n`);
   
   if (!PIPEDRIVE_TOKEN) {
     console.warn('⚠️  PIPEDRIVE_API_TOKEN nicht gesetzt! Setze die Umgebungsvariable.');
   }
   if (!META_PIXEL_ID || !META_CAPI_TOKEN) {
-    console.warn('⚠️  META_PIXEL_ID / META_CAPI_TOKEN nicht gesetzt — Meta CAPI deaktiviert.');
+    console.warn('⚠️  Meta CAPI deaktiviert — setze META_PIXEL_ID/META_DATASET_ID und META_CAPI_TOKEN/META_CAPI_ACCESS_TOKEN.');
   } else {
-    console.log(`   Meta CAPI aktiv (Pixel ${META_PIXEL_ID}, ${META_API_VERSION})`);
+    console.log(`   Meta CAPI aktiv (Dataset ${META_PIXEL_ID}, ${META_API_VERSION})`);
+  }
+  if (!PIPEDRIVE_WEBHOOK_SECRET) {
+    console.warn('⚠️  PIPEDRIVE_WEBHOOK_SECRET nicht gesetzt — /api/pipedrive-webhook ist ungeschützt.');
   }
 });
