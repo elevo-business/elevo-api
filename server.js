@@ -1,19 +1,30 @@
 /**
  * ELEVO API Proxy
- * Verbindet elevo.solutions mit Pipedrive CRM
- * 
+ * Verbindet elevo.solutions mit Pipedrive CRM + Meta Conversions API (CAPI)
+ *
  * Endpoints:
  *   POST /api/contact  — Kontaktformular → Pipedrive (Person + Deal + Activity)
+ *                        + server-seitiges Meta-Lead-Event (CAPI, dedupliziert
+ *                          via event_id mit dem Browser-Pixel)
  *   GET  /api/health    — Health Check
  */
 
 const http = require('http');
 const https = require('https');
+const crypto = require('crypto');
 
 // ─── Config ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const PIPEDRIVE_TOKEN = process.env.PIPEDRIVE_API_TOKEN;
 const PIPEDRIVE_BASE = 'https://api.pipedrive.com/v1';
+
+// Meta Conversions API (server-seitig). Token + Pixel-ID kommen aus der
+// Umgebung (Coolify) — NIE im Code/Repo. Ohne beide Werte wird CAPI still
+// übersprungen, der Rest funktioniert weiter.
+const META_PIXEL_ID = process.env.META_PIXEL_ID;
+const META_CAPI_TOKEN = process.env.META_CAPI_TOKEN;
+const META_API_VERSION = process.env.META_API_VERSION || 'v21.0';
+const META_TEST_EVENT_CODE = process.env.META_TEST_EVENT_CODE; // optional, nur fürs Testing-Tool
 const ALLOWED_ORIGINS = [
   'https://elevo.solutions',
   'https://www.elevo.solutions',
@@ -104,30 +115,153 @@ function pipedriveFetch(endpoint, method, data) {
   });
 }
 
+// ─── Meta Conversions API (CAPI) ──────────────────────────────────
+//
+// Sendet ein server-seitiges Lead-Event an Meta. Personendaten werden
+// laut Meta-Vorgabe normalisiert (trim + lowercase) und mit SHA-256
+// gehasht. fbp/fbc, IP und User-Agent verbessern das Matching. Über das
+// gemeinsame event_id (vom Browser-Pixel erzeugt) dedupliziert Meta das
+// Server- und das Browser-Event.
+
+function sha256(value) {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+// E-Mail / Name: trim + lowercase, dann hashen.
+function hashNormalized(value) {
+  if (!value) return null;
+  const v = String(value).trim().toLowerCase();
+  return v ? sha256(v) : null;
+}
+
+// Telefon: nur Ziffern, Ländervorwahl ohne '+'. Deutsche Nummern mit
+// führender 0 werden auf 49 normalisiert (Best-Effort).
+function hashPhone(value) {
+  if (!value) return null;
+  let d = String(value).replace(/[^0-9]/g, '');
+  if (!d) return null;
+  if (d.startsWith('00')) d = d.slice(2);
+  else if (d.startsWith('0')) d = '49' + d.slice(1);
+  return sha256(d);
+}
+
+function httpsPostJson(urlStr, payload) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlStr);
+    const body = JSON.stringify(payload);
+    const options = {
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      }
+    };
+    const r = https.request(options, (res) => {
+      let b = '';
+      res.on('data', chunk => b += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(b);
+          if (res.statusCode >= 200 && res.statusCode < 300) resolve(parsed);
+          else reject(new Error(`Meta API ${res.statusCode}: ${b}`));
+        } catch (e) {
+          reject(new Error(`Meta API: Antwort nicht lesbar (${res.statusCode})`));
+        }
+      });
+    });
+    r.on('error', reject);
+    r.write(body);
+    r.end();
+  });
+}
+
+async function sendMetaConversion({ eventName = 'Lead', eventId, eventSourceUrl, clientIp, userAgent, user = {}, customData = {} }) {
+  if (!META_PIXEL_ID || !META_CAPI_TOKEN) {
+    console.warn('⚠️  Meta CAPI: META_PIXEL_ID / META_CAPI_TOKEN nicht gesetzt — Event übersprungen.');
+    return;
+  }
+
+  const userData = {};
+  const em = hashNormalized(user.email);     if (em) userData.em = [em];
+  const ph = hashPhone(user.phone);          if (ph) userData.ph = [ph];
+  const fn = hashNormalized(user.firstName); if (fn) userData.fn = [fn];
+  const ln = hashNormalized(user.lastName);  if (ln) userData.ln = [ln];
+  if (clientIp) userData.client_ip_address = clientIp;
+  if (userAgent) userData.client_user_agent = userAgent;
+  if (user.fbp) userData.fbp = user.fbp;
+  if (user.fbc) userData.fbc = user.fbc;
+
+  const event = {
+    event_name: eventName,
+    event_time: Math.floor(Date.now() / 1000),
+    action_source: 'website',
+    user_data: userData
+  };
+  if (eventId) event.event_id = eventId;
+  if (eventSourceUrl) event.event_source_url = eventSourceUrl;
+  if (customData && Object.keys(customData).length) event.custom_data = customData;
+
+  const payload = { data: [event] };
+  if (META_TEST_EVENT_CODE) payload.test_event_code = META_TEST_EVENT_CODE;
+
+  const url = `https://graph.facebook.com/${META_API_VERSION}/${META_PIXEL_ID}/events?access_token=${encodeURIComponent(META_CAPI_TOKEN)}`;
+  const result = await httpsPostJson(url, payload);
+  console.log(`✓ Meta CAPI ${eventName} gesendet (event_id: ${eventId || '—'}, events_received: ${result.events_received ?? '?'})`);
+  return result;
+}
+
 // ─── Validation ───────────────────────────────────────────────────
+
+// Vollen Namen ("Max Mustermann") in Vor-/Nachname zerlegen.
+function splitName(full) {
+  const parts = String(full).trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return { firstName: '', lastName: '' };
+  if (parts.length === 1) return { firstName: parts[0], lastName: '' };
+  return { firstName: parts[0], lastName: parts.slice(1).join(' ') };
+}
 
 function validateContact(data) {
   const errors = [];
-  if (!data.firstName || data.firstName.trim().length < 1) errors.push('Vorname fehlt');
-  if (!data.lastName || data.lastName.trim().length < 1) errors.push('Nachname fehlt');
+
+  // Vor-/Nachname: explizite Felder bevorzugen, sonst aus `name` ableiten.
+  // (Das Kontaktformular sendet nur `name`, der Funnel-Check beides.)
+  let firstName = (data.firstName || '').trim();
+  let lastName = (data.lastName || '').trim();
+  if ((!firstName || !lastName) && data.name) {
+    const s = splitName(data.name);
+    if (!firstName) firstName = s.firstName;
+    if (!lastName) lastName = s.lastName;
+  }
+
+  if (!firstName) errors.push('Name fehlt');
   if (!data.email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.email)) errors.push('Ungültige E-Mail');
-  
+
   // Sanitize
   if (errors.length === 0) {
     return {
       valid: true,
       data: {
-        firstName: data.firstName.trim().substring(0, 100),
-        lastName: data.lastName.trim().substring(0, 100),
+        firstName: firstName.substring(0, 100),
+        lastName: lastName.substring(0, 100),
         email: data.email.trim().toLowerCase().substring(0, 200),
-        topic: (data.topic || 'Allgemein').trim().substring(0, 200),
+        phone: (data.phone || '').trim().substring(0, 50),
+        topic: (data.topic || data.service || 'Allgemein').trim().substring(0, 200),
         message: (data.message || '').trim().substring(0, 2000),
         source: (data.source || 'Website').trim().substring(0, 100),
         // UTM Tracking
         utm_source: (data.utm_source || '').trim().substring(0, 200),
         utm_medium: (data.utm_medium || '').trim().substring(0, 200),
         utm_campaign: (data.utm_campaign || '').trim().substring(0, 200),
-        utm_term: (data.utm_term || '').trim().substring(0, 200)
+        utm_term: (data.utm_term || '').trim().substring(0, 200),
+        // Meta-Tracking (Dedup-Parameter). event_id wird vom Browser-Pixel
+        // erzeugt und nur gesetzt, wenn der Nutzer Marketing-Consent gegeben
+        // hat — fehlt es, wird KEIN CAPI-Event gesendet.
+        metaEventId: (data.metaEventId || data.event_id || '').trim().substring(0, 100),
+        fbp: (data.fbp || '').trim().substring(0, 200),
+        fbc: (data.fbc || '').trim().substring(0, 300),
+        eventSourceUrl: (data.eventSourceUrl || '').trim().substring(0, 500)
       }
     };
   }
@@ -200,21 +334,25 @@ async function handleContact(req, res) {
       return jsonResponse(res, 400, { success: false, errors: validation.errors });
     }
 
-    const { firstName, lastName, email, topic, message, source, utm_source, utm_medium, utm_campaign, utm_term } = validation.data;
+    const { firstName, lastName, email, phone, topic, message, source, utm_source, utm_medium, utm_campaign, utm_term,
+            metaEventId, fbp, fbc, eventSourceUrl } = validation.data;
+
+    const fullName = `${firstName} ${lastName}`.trim();
 
     // 1. Person in Pipedrive anlegen
     const person = await pipedriveFetch('/persons', 'POST', {
-      name: `${firstName} ${lastName}`,
+      name: fullName,
       first_name: firstName,
       last_name: lastName,
       email: [{ value: email, primary: true }],
+      ...(phone ? { phone: [{ value: phone, primary: true }] } : {}),
       visible_to: 3 // Für alle sichtbar
     });
 
-    console.log(`✓ Person erstellt: ${person.id} — ${firstName} ${lastName}`);
+    console.log(`✓ Person erstellt: ${person.id} — ${fullName}`);
 
     // 2. Deal anlegen mit UTM Custom Fields
-    const dealTitle = `${firstName} ${lastName} — ${topic}`;
+    const dealTitle = `${fullName} — ${topic}`;
     const dealData = {
       title: dealTitle,
       person_id: person.id,
@@ -245,7 +383,7 @@ async function handleContact(req, res) {
     // 4. Aktivität anlegen (Follow-up heute)
     const today = new Date().toISOString().split('T')[0];
     await pipedriveFetch('/activities', 'POST', {
-      subject: `Erstgespräch planen: ${firstName} ${lastName}`,
+      subject: `Erstgespräch planen: ${fullName}`,
       type: 'call',
       deal_id: deal.id,
       person_id: person.id,
@@ -257,11 +395,28 @@ async function handleContact(req, res) {
 
     console.log(`✓ Aktivität erstellt für Deal ${deal.id}`);
 
-    // Erfolg
+    // Erfolg — Antwort sofort senden, bevor das CAPI-Event gefeuert wird,
+    // damit Meta-Latenz die Formular-Antwort nicht ausbremst.
     jsonResponse(res, 200, {
       success: true,
       message: 'Anfrage erfolgreich übermittelt.'
     });
+
+    // 5. Meta Conversions API — nur wenn der Client ein event_id mitschickt
+    //    (= Marketing-Consent im Browser erteilt). Fehler hier dürfen die
+    //    bereits erfolgreiche Anfrage nicht beeinflussen → fire-and-forget.
+    if (metaEventId) {
+      const clientIp = String(ip).split(',')[0].trim();
+      sendMetaConversion({
+        eventName: 'Lead',
+        eventId: metaEventId,
+        eventSourceUrl,
+        clientIp,
+        userAgent: req.headers['user-agent'],
+        user: { email, phone, firstName, lastName, fbp, fbc },
+        customData: { content_name: topic, lead_source: utm_source || source }
+      }).catch(err => console.error('❌ Meta CAPI Fehler:', err.message));
+    }
 
   } catch (error) {
     console.error('❌ Fehler:', error.message);
@@ -285,9 +440,13 @@ const server = http.createServer(async (req, res) => {
 
   // Routes
   if (req.method === 'GET' && req.url === '/api/health') {
-    return jsonResponse(res, 200, { 
-      status: 'ok', 
+    return jsonResponse(res, 200, {
+      status: 'ok',
       service: 'ELEVO API Proxy',
+      integrations: {
+        pipedrive: Boolean(PIPEDRIVE_TOKEN),
+        metaCapi: Boolean(META_PIXEL_ID && META_CAPI_TOKEN)
+      },
       timestamp: new Date().toISOString()
     });
   }
@@ -307,5 +466,10 @@ server.listen(PORT, () => {
   
   if (!PIPEDRIVE_TOKEN) {
     console.warn('⚠️  PIPEDRIVE_API_TOKEN nicht gesetzt! Setze die Umgebungsvariable.');
+  }
+  if (!META_PIXEL_ID || !META_CAPI_TOKEN) {
+    console.warn('⚠️  META_PIXEL_ID / META_CAPI_TOKEN nicht gesetzt — Meta CAPI deaktiviert.');
+  } else {
+    console.log(`   Meta CAPI aktiv (Pixel ${META_PIXEL_ID}, ${META_API_VERSION})`);
   }
 });
