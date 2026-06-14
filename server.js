@@ -325,8 +325,10 @@ setInterval(() => {
 // ─── Spam-Schutz (Honeypot) ──────────────────────────────────────
 
 function isSpam(data) {
-  // Honeypot-Feld: wenn "company" ausgefüllt ist, ist es ein Bot
-  if (data.company && data.company.trim().length > 0) return true;
+  // Honeypot-Feld: das versteckte Feld `_hp` (für Menschen leer, Bots füllen es).
+  // NICHT `company` — das ist in beiden Formularen ein legitimes Feld
+  // (Coaching/Marke bzw. Website) und darf keine Anfrage verwerfen.
+  if (data._hp && String(data._hp).trim().length > 0) return true;
   // Zeitcheck: wenn das Formular in unter 2 Sekunden ausgefüllt wird
   if (data._ts && Date.now() - parseInt(data._ts) < 2000) return true;
   return false;
