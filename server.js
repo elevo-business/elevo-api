@@ -203,7 +203,7 @@ function httpsPostJson(urlStr, payload) {
   });
 }
 
-async function sendMetaConversion({ eventName = 'Lead', eventId, eventSourceUrl, clientIp, userAgent, user = {}, customData = {} }) {
+async function sendMetaConversion({ eventName = 'Lead', eventId, eventTime, eventSourceUrl, actionSource, clientIp, userAgent, user = {}, customData = {} }) {
   if (!META_PIXEL_ID || !META_CAPI_TOKEN) {
     console.warn('⚠️  Meta CAPI: META_PIXEL_ID / META_CAPI_TOKEN nicht gesetzt — Event übersprungen.');
     return;
@@ -214,15 +214,25 @@ async function sendMetaConversion({ eventName = 'Lead', eventId, eventSourceUrl,
   const ph = hashPhone(user.phone);          if (ph) userData.ph = [ph];
   const fn = hashNormalized(user.firstName); if (fn) userData.fn = [fn];
   const ln = hashNormalized(user.lastName);  if (ln) userData.ln = [ln];
+  // external_id (stabile _eid des Browsers) ebenfalls gehasht — hebt die
+  // Event Match Quality und verknüpft Browser- mit Server-Events.
+  const ext = hashNormalized(user.externalId); if (ext) userData.external_id = [ext];
   if (clientIp) userData.client_ip_address = clientIp;
   if (userAgent) userData.client_user_agent = userAgent;
   if (user.fbp) userData.fbp = user.fbp;
   if (user.fbc) userData.fbc = user.fbc;
 
+  // event_time: vom Client gelieferte Zeit bevorzugen (Browser- und Server-
+  // Event sollen dieselbe Zeit tragen), sonst Server-Zeit. Auf einen
+  // plausiblen Wert (Sekunden, nicht in der Zukunft) begrenzen.
+  const nowSec = Math.floor(Date.now() / 1000);
+  let ts = Number(eventTime);
+  if (!Number.isFinite(ts) || ts <= 0 || ts > nowSec + 60) ts = nowSec;
+
   const event = {
     event_name: eventName,
-    event_time: Math.floor(Date.now() / 1000),
-    action_source: 'website',
+    event_time: ts,
+    action_source: actionSource || 'website',
     user_data: userData
   };
   if (eventId) event.event_id = eventId;
@@ -266,6 +276,12 @@ function validateContact(data) {
 
   // Sanitize
   if (errors.length === 0) {
+    // UTM kommt von der Vertriebssystem-LP verschachtelt (data.utm.utm_*),
+    // vom alten Kontaktformular flach (data.utm_*) — beide Formen lesen.
+    const utm = (data.utm && typeof data.utm === 'object') ? data.utm : {};
+    const pickUtm = (k) => String(utm[k] || data[k] || '').trim().substring(0, 200);
+    // event_time kommt als Unix-Sekunden vom Client; nur Zahlen übernehmen.
+    const eventTime = Number.isFinite(Number(data.eventTime)) ? Math.floor(Number(data.eventTime)) : null;
     return {
       valid: true,
       data: {
@@ -277,16 +293,20 @@ function validateContact(data) {
         message: (data.message || '').trim().substring(0, 2000),
         source: (data.source || 'Website').trim().substring(0, 100),
         // UTM Tracking
-        utm_source: (data.utm_source || '').trim().substring(0, 200),
-        utm_medium: (data.utm_medium || '').trim().substring(0, 200),
-        utm_campaign: (data.utm_campaign || '').trim().substring(0, 200),
-        utm_term: (data.utm_term || '').trim().substring(0, 200),
-        // Meta-Tracking (Dedup-Parameter). event_id wird vom Browser-Pixel
-        // erzeugt und nur gesetzt, wenn der Nutzer Marketing-Consent gegeben
-        // hat — fehlt es, wird KEIN CAPI-Event gesendet.
+        utm_source: pickUtm('utm_source'),
+        utm_medium: pickUtm('utm_medium'),
+        utm_campaign: pickUtm('utm_campaign'),
+        utm_content: pickUtm('utm_content'),
+        utm_term: pickUtm('utm_term'),
+        // Meta-Tracking (Dedup- + Match-Parameter). event_id wird vom Browser-
+        // Pixel erzeugt und nur gesetzt, wenn der Nutzer Marketing-Consent
+        // gegeben hat — fehlt es, wird KEIN CAPI-Event gesendet.
         metaEventId: (data.metaEventId || data.event_id || '').trim().substring(0, 100),
         fbp: (data.fbp || '').trim().substring(0, 200),
         fbc: (data.fbc || '').trim().substring(0, 300),
+        externalId: (data.externalId || '').trim().substring(0, 200),
+        actionSource: (data.actionSource || '').trim().substring(0, 50),
+        eventTime,
         eventSourceUrl: (data.eventSourceUrl || '').trim().substring(0, 500)
       }
     };
@@ -362,8 +382,8 @@ async function handleContact(req, res) {
       return jsonResponse(res, 400, { success: false, errors: validation.errors });
     }
 
-    const { firstName, lastName, email, phone, topic, message, source, utm_source, utm_medium, utm_campaign, utm_term,
-            metaEventId, fbp, fbc, eventSourceUrl } = validation.data;
+    const { firstName, lastName, email, phone, topic, message, source, utm_source, utm_medium, utm_campaign, utm_content, utm_term,
+            metaEventId, fbp, fbc, externalId, actionSource, eventTime, eventSourceUrl } = validation.data;
 
     const fullName = `${firstName} ${lastName}`.trim();
 
@@ -435,14 +455,23 @@ async function handleContact(req, res) {
     //    bereits erfolgreiche Anfrage nicht beeinflussen → fire-and-forget.
     if (metaEventId) {
       const clientIp = String(ip).split(',')[0].trim();
+      // UTM nur mit Werten in custom_data übernehmen (leere Felder weglassen).
+      const utmData = {};
+      if (utm_source)   utmData.utm_source = utm_source;
+      if (utm_medium)   utmData.utm_medium = utm_medium;
+      if (utm_campaign) utmData.utm_campaign = utm_campaign;
+      if (utm_content)  utmData.utm_content = utm_content;
+      if (utm_term)     utmData.utm_term = utm_term;
       sendMetaConversion({
         eventName: 'Lead',
         eventId: metaEventId,
+        eventTime,
         eventSourceUrl,
+        actionSource,
         clientIp,
         userAgent: req.headers['user-agent'],
-        user: { email, phone, firstName, lastName, fbp, fbc },
-        customData: { content_name: topic, lead_source: utm_source || source }
+        user: { email, phone, firstName, lastName, externalId, fbp, fbc },
+        customData: { content_name: topic, lead_source: utm_source || source, ...utmData }
       }).catch(err => console.error('❌ Meta CAPI Fehler:', err.message));
     }
 
