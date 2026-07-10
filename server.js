@@ -6,6 +6,8 @@
  *   POST /api/contact  — Kontaktformular → Pipedrive (Person + Deal + Activity)
  *                        + server-seitiges Meta-Lead-Event (CAPI, dedupliziert
  *                          via event_id mit dem Browser-Pixel)
+ *   POST /api/aachen-lead — Landingpage /webseite-aachen → monday.com-Board
+ *                        "Website-Anfragen Aachen (Meta-Kampagne)" + Meta CAPI
  *   GET  /api/health    — Health Check
  */
 
@@ -31,6 +33,31 @@ const META_TEST_EVENT_CODE = process.env.META_TEST_EVENT_CODE; // optional, nur 
 // Webhook-URL ?token=<wert> tragen, sonst 401. Verhindert gefälschte Leads.
 const PIPEDRIVE_WEBHOOK_SECRET = process.env.PIPEDRIVE_WEBHOOK_SECRET;
 const PIPEDRIVE_DOMAIN = process.env.PIPEDRIVE_COMPANY_DOMAIN || 'elevo';
+
+// monday.com (Aachen-Kampagne). Token kommt aus der Umgebung (Coolify):
+// monday → Profilbild → Entwickler → "Meine Access-Tokens". Ohne Token
+// antwortet /api/aachen-lead mit 503, der Rest der API läuft weiter.
+const MONDAY_TOKEN = process.env.MONDAY_API_TOKEN;
+const MONDAY_AACHEN_BOARD_ID = process.env.MONDAY_AACHEN_BOARD_ID || '5100041969';
+// Spalten-IDs des Boards "Website-Anfragen Aachen (Meta-Kampagne)"
+// (vom WorkForm erzeugt, IDs entsprechen den Formular-Fragen).
+const MONDAY_COLS = {
+  company: 'short_texth64c4e6p',
+  website: 'linku5raltic',
+  timing: 'single_selectcuutq4m',
+  email: 'emailvoy0oiac',
+  phone: 'phoneptihnc14',
+  utmCampaign: 'short_texttykp7cku',
+  utmContent: 'short_text7j1mcvvv'
+};
+// Erlaubte Antworten der Zeitpunkt-Frage — müssen den Status-Labels auf dem
+// Board exakt entsprechen (create_labels_if_missing ist bewusst aus).
+const MONDAY_TIMING_LABELS = [
+  'So schnell wie möglich',
+  'In den nächsten 1–3 Monaten',
+  'In 3–6 Monaten',
+  'Ich schaue mich erst mal nur um'
+];
 const ALLOWED_ORIGINS = [
   'https://elevo.solutions',
   'https://www.elevo.solutions',
@@ -138,6 +165,46 @@ function pipedriveGet(endpoint) {
         }
       });
     }).on('error', reject);
+  });
+}
+
+// ─── monday.com API ───────────────────────────────────────────────
+
+function mondayFetch(query, variables) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ query, variables });
+    const options = {
+      hostname: 'api.monday.com',
+      path: '/v2',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'Authorization': MONDAY_TOKEN,
+        'API-Version': '2024-10'
+      }
+    };
+    const r = https.request(options, (res) => {
+      let b = '';
+      res.on('data', chunk => b += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(b);
+          if (parsed.errors && parsed.errors.length) {
+            reject(new Error(`monday API: ${JSON.stringify(parsed.errors)}`));
+          } else if (res.statusCode >= 200 && res.statusCode < 300 && parsed.data) {
+            resolve(parsed.data);
+          } else {
+            reject(new Error(`monday API ${res.statusCode}: ${b.substring(0, 300)}`));
+          }
+        } catch (e) {
+          reject(new Error(`monday API: Antwort nicht lesbar (${res.statusCode})`));
+        }
+      });
+    });
+    r.on('error', reject);
+    r.write(body);
+    r.end();
   });
 }
 
@@ -455,6 +522,139 @@ async function handleContact(req, res) {
   }
 }
 
+// ─── Aachen-Kampagne: Landingpage-Formular → monday.com ──────────
+//
+// Natives Formular auf /webseite-aachen (statt WorkForm-Embed). Legt den
+// Lead als Item auf dem Kampagnen-Board an und feuert das server-seitige
+// Meta-Lead-Event — gleiche Dedup-Mechanik wie /api/contact.
+
+function validateAachenLead(data) {
+  const errors = [];
+
+  const name = (data.name || '').trim();
+  const company = (data.company || '').trim();
+  const email = (data.email || '').trim().toLowerCase();
+  const phone = (data.phone || '').trim();
+
+  if (!name) errors.push('Name fehlt');
+  if (!company) errors.push('Unternehmen fehlt');
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) errors.push('Ungültige E-Mail');
+  if (!phone || phone.replace(/[^0-9]/g, '').length < 6) errors.push('Ungültige Telefonnummer');
+
+  if (errors.length > 0) return { valid: false, errors };
+
+  // Website normalisieren (optional, Nutzer tippt oft ohne Protokoll).
+  let website = (data.website || '').trim().substring(0, 300);
+  if (website && !/^https?:\/\//i.test(website)) website = 'https://' + website;
+
+  // Zeitpunkt gegen die Board-Labels whitelisten — unbekannte Werte fallen
+  // still weg, statt die Item-Erstellung scheitern zu lassen.
+  const timing = MONDAY_TIMING_LABELS.includes((data.timing || '').trim())
+    ? data.timing.trim()
+    : '';
+
+  return {
+    valid: true,
+    data: {
+      name: name.substring(0, 200),
+      company: company.substring(0, 200),
+      email: email.substring(0, 200),
+      phone: phone.substring(0, 50),
+      website,
+      timing,
+      utm_source: (data.utm_source || '').trim().substring(0, 200),
+      utm_medium: (data.utm_medium || '').trim().substring(0, 200),
+      utm_campaign: (data.utm_campaign || '').trim().substring(0, 200),
+      utm_content: (data.utm_content || '').trim().substring(0, 200),
+      utm_term: (data.utm_term || '').trim().substring(0, 200),
+      metaEventId: (data.metaEventId || '').trim().substring(0, 100),
+      fbp: (data.fbp || '').trim().substring(0, 200),
+      fbc: (data.fbc || '').trim().substring(0, 300),
+      eventSourceUrl: (data.eventSourceUrl || '').trim().substring(0, 500)
+    }
+  };
+}
+
+async function handleAachenLead(req, res) {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+
+  if (isRateLimited(ip)) {
+    return jsonResponse(res, 429, {
+      success: false,
+      error: 'Zu viele Anfragen. Bitte versuche es in einer Minute erneut.'
+    });
+  }
+
+  if (!MONDAY_TOKEN) {
+    console.error('❌ /api/aachen-lead: MONDAY_API_TOKEN nicht gesetzt.');
+    return jsonResponse(res, 503, {
+      success: false,
+      error: 'Anfrage konnte nicht gespeichert werden. Schreib uns direkt: hallo@elevo.solutions'
+    });
+  }
+
+  try {
+    const rawData = await parseBody(req);
+
+    // Spam Check (Honeypot + Zeitcheck) — Bots bekommen freundlich 200.
+    if (isSpam(rawData)) {
+      return jsonResponse(res, 200, { success: true });
+    }
+
+    const validation = validateAachenLead(rawData);
+    if (!validation.valid) {
+      return jsonResponse(res, 400, { success: false, errors: validation.errors });
+    }
+
+    const d = validation.data;
+
+    const columnValues = {
+      [MONDAY_COLS.company]: d.company,
+      [MONDAY_COLS.email]: { email: d.email, text: d.email },
+      [MONDAY_COLS.phone]: { phone: d.phone, countryShortName: 'DE' }
+    };
+    if (d.website) {
+      columnValues[MONDAY_COLS.website] = { url: d.website, text: d.website.replace(/^https?:\/\//i, '') };
+    }
+    if (d.timing) columnValues[MONDAY_COLS.timing] = { label: d.timing };
+    if (d.utm_campaign) columnValues[MONDAY_COLS.utmCampaign] = d.utm_campaign;
+    if (d.utm_content) columnValues[MONDAY_COLS.utmContent] = d.utm_content;
+
+    const result = await mondayFetch(
+      `mutation ($board: ID!, $name: String!, $cols: JSON!) {
+        create_item (board_id: $board, item_name: $name, column_values: $cols, create_labels_if_missing: false) { id }
+      }`,
+      { board: MONDAY_AACHEN_BOARD_ID, name: d.name, cols: JSON.stringify(columnValues) }
+    );
+
+    console.log(`✓ monday-Item erstellt: ${result.create_item.id} — ${d.name} (${d.company})`);
+
+    // Erfolg sofort melden, CAPI danach (fire-and-forget wie bei /api/contact).
+    jsonResponse(res, 200, { success: true, message: 'Anfrage erfolgreich übermittelt.' });
+
+    if (d.metaEventId) {
+      const clientIp = String(ip).split(',')[0].trim();
+      const s = splitName(d.name);
+      sendMetaConversion({
+        eventName: 'Lead',
+        eventId: d.metaEventId,
+        eventSourceUrl: d.eventSourceUrl,
+        clientIp,
+        userAgent: req.headers['user-agent'],
+        user: { email: d.email, phone: d.phone, firstName: s.firstName, lastName: s.lastName, fbp: d.fbp, fbc: d.fbc },
+        customData: { content_name: 'webseite-aachen', lead_source: d.utm_source || 'webseite-aachen' }
+      }).catch(err => console.error('❌ Meta CAPI Fehler (aachen-lead):', err.message));
+    }
+
+  } catch (error) {
+    console.error('❌ Fehler (aachen-lead):', error.message);
+    jsonResponse(res, 500, {
+      success: false,
+      error: 'Es ist ein Fehler aufgetreten. Bitte versuche es erneut oder schreib uns direkt: hallo@elevo.solutions'
+    });
+  }
+}
+
 // ─── Pipedrive-Webhook → Meta CAPI (Funnel-Check-Buchungen) ───────
 //
 // Schließt die Tracking-Lücke des Scheduler-iframes: Die Funnel-Check-LP
@@ -547,7 +747,8 @@ const server = http.createServer(async (req, res) => {
       service: 'ELEVO API Proxy',
       integrations: {
         pipedrive: Boolean(PIPEDRIVE_TOKEN),
-        metaCapi: Boolean(META_PIXEL_ID && META_CAPI_TOKEN)
+        metaCapi: Boolean(META_PIXEL_ID && META_CAPI_TOKEN),
+        monday: Boolean(MONDAY_TOKEN)
       },
       timestamp: new Date().toISOString()
     });
@@ -555,6 +756,10 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && path === '/api/contact') {
     return handleContact(req, res);
+  }
+
+  if (req.method === 'POST' && path === '/api/aachen-lead') {
+    return handleAachenLead(req, res);
   }
 
   if (req.method === 'POST' && path === '/api/pipedrive-webhook') {
@@ -581,5 +786,10 @@ server.listen(PORT, () => {
   }
   if (!PIPEDRIVE_WEBHOOK_SECRET) {
     console.warn('⚠️  PIPEDRIVE_WEBHOOK_SECRET nicht gesetzt — /api/pipedrive-webhook ist ungeschützt.');
+  }
+  if (!MONDAY_TOKEN) {
+    console.warn('⚠️  MONDAY_API_TOKEN nicht gesetzt — /api/aachen-lead antwortet mit 503.');
+  } else {
+    console.log(`   monday.com aktiv (Board ${MONDAY_AACHEN_BOARD_ID})`);
   }
 });
