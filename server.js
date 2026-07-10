@@ -742,7 +742,7 @@ const server = http.createServer(async (req, res) => {
 
   // Routes
   if (req.method === 'GET' && path === '/api/health') {
-    return jsonResponse(res, 200, {
+    const payload = {
       status: 'ok',
       service: 'ELEVO API Proxy',
       integrations: {
@@ -751,7 +751,19 @@ const server = http.createServer(async (req, res) => {
         monday: Boolean(MONDAY_TOKEN)
       },
       timestamp: new Date().toISOString()
-    });
+    };
+    // ?deep=1 prüft den monday-Token aktiv (winzige me-Query) und meldet die
+    // Fehlerklasse — hilft bei der Diagnose ohne Zugriff auf Container-Logs.
+    // Es wird nie der Token selbst ausgegeben.
+    if (url.searchParams.get('deep') === '1' && MONDAY_TOKEN) {
+      try {
+        const me = await mondayFetch('query { me { id } }', {});
+        payload.mondayCheck = { ok: true, userId: me.me && me.me.id };
+      } catch (err) {
+        payload.mondayCheck = { ok: false, error: String(err.message).substring(0, 300) };
+      }
+    }
+    return jsonResponse(res, 200, payload);
   }
 
   if (req.method === 'POST' && path === '/api/contact') {
